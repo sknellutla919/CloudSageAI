@@ -1,0 +1,15 @@
+{
+    "name": "cloudsageai-api",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+      "dev": "next dev",
+      "build": "next build",
+      "start": "next start"
+    },
+    "dependencies": {
+      "@microsoft/applicationinsights-web": "^2.8.9",
+      "next": "12.3.0",
+      "next-auth": "^4.10.3"
+    }
+  }

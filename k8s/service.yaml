@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatbot-ui-service
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Internal LB for VNET
+    #service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "aks-subnet"  # Replace with your subnet
+spec:
+  selector:
+    app: chatbot-ui
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: LoadBalancer
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatbot-api-service
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Internal LB for VNET
+    #service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "aks-subnet"  # Replace with your subnet
+spec:
+  selector:
+    app: chatbot-api
+  ports:
+    - protocol: TCP
+      port: 3001
+      targetPort: 3001
+  type: LoadBalancer

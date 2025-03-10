@@ -1,0 +1,103 @@
+trigger:
+  branches:
+    include:
+      - main2  # Adjust the branch if needed
+
+pool:
+  vmImage: "ubuntu-latest"
+
+# Define all required environment variables here
+variables:
+  RESOURCE_GROUP: 'ml-chatbot-rg'
+  JIRA_API_URL: 'https://cloudsageai.atlassian.net/rest/api/3'
+  JIRA_API_USERNAME: 'santoshk.nellutla@gmail.com'
+  JIRA_API_TOKEN: ''
+  CONFLUENCE_API_URL: 'https://cloudsageai.atlassian.net/wiki'
+  CONFLUENCE_API_USERNAME: 'santoshk.nellutla@gmail.com'
+  CONFLUENCE_API_TOKEN: ''
+  COSMOSDB_URL: 'https://mlchatbotcosmos.documents.azure.com:443'
+  COSMOSDB_KEY: ''
+  COSMOSDB_DATABASE: 'mlchatbot'
+  COSMOSDB_CONTAINER: 'knowledgebase'
+  AZURE_VISION_ENDPOINT: 'https://westeurope.api.cognitive.microsoft.com/'
+  AZURE_VISION_KEY: ''
+  AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: 'https://ml-chatbot-doc-intelligence.cognitiveservices.azure.com/'
+  AZURE_DOCUMENT_INTELLIGENCE_KEY: ''
+
+stages:
+  - stage: Package_FunctionApp
+    displayName: "Package Function App Code"
+    jobs:
+      - job: ArchiveFunctionApp
+        displayName: "Archive Function App"
+        steps:
+          - script: |
+              python -m pip install --upgrade pip
+              pip install azure-ai-vision-imageanalysis
+              pip install -r function-app/fetch_data/requirements.txt -t function-app/fetch_data/
+            displayName: "Install Python Dependencies"
+
+          - task: ArchiveFiles@2
+            displayName: "Archive Function App Code"
+            inputs:
+              rootFolderOrFile: "function-app/fetch_data/"
+              includeRootFolder: true
+              archiveType: "zip"
+              archiveFile: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Function App Artifact"
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+              artifactName: "FunctionApp"
+
+  - stage: Deploy_FunctionApp
+    displayName: "Deploy Function App to Azure"
+    dependsOn: Package_FunctionApp
+    jobs:
+      - job: DeployFunctionApp
+        displayName: "Deploy Function App"
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Function App Artifact"
+            inputs:
+              artifact: "FunctionApp"
+              path: "$(Pipeline.Workspace)/FunctionApp"
+
+          - task: AzureFunctionApp@1
+            displayName: "Deploy to Azure Function"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              appName: "ml-chatbot-api"
+              package: "$(Pipeline.Workspace)/FunctionApp/function-app.zip"
+
+          - task: AzureCLI@2
+            displayName: "Configure Function App Environment Variables"
+            inputs:
+              azureSubscription: 'CloudSageAI-SP'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az functionapp config appsettings set \
+                  --name ml-chatbot-api \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --settings \
+                    JIRA_API_URL=$(JIRA_API_URL) \
+                    JIRA_API_USERNAME=$(JIRA_API_USERNAME) \
+                    JIRA_API_TOKEN=$(JIRA_API_TOKEN) \
+                    CONFLUENCE_API_URL=$(CONFLUENCE_API_URL) \
+                    CONFLUENCE_API_USERNAME=$(CONFLUENCE_API_USERNAME) \
+                    CONFLUENCE_API_TOKEN=$(CONFLUENCE_API_TOKEN) \
+                    COSMOSDB_URL=$(COSMOSDB_URL) \
+                    COSMOSDB_KEY=$(COSMOSDB_KEY) \
+                    COSMOSDB_DATABASE=$(COSMOSDB_DATABASE) \
+                    COSMOSDB_CONTAINER=$(COSMOSDB_CONTAINER) \
+                    AZURE_VISION_ENDPOINT=$(AZURE_VISION_ENDPOINT) \
+                    AZURE_VISION_KEY=$(AZURE_VISION_KEY) \
+                    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=$(AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT) \
+                    AZURE_DOCUMENT_INTELLIGENCE_KEY=$(AZURE_DOCUMENT_INTELLIGENCE_KEY) \
+                    FUNCTIONS_WORKER_RUNTIME=python \
+                    AzureWebJobsStorage="connectionstring" \
+                    FUNCTIONS_EXTENSION_VERSION=~3
+

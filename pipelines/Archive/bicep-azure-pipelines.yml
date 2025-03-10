@@ -1,0 +1,83 @@
+trigger:
+  branches:
+    include:
+      - main2
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Deploy_Infrastructure
+    displayName: "Deploy Infrastructure using Bicep"
+    jobs:
+      - job: DeployBicep
+        displayName: "Deploy Bicep Files"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Login to Azure"
+            inputs:
+              azureSubscription: "Azure-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az login --service-principal -u $(AZURE_CLIENT_ID) -p $(AZURE_CLIENT_SECRET) --tenant $(AZURE_TENANT_ID)
+
+          - task: AzureCLI@2
+            displayName: "Deploy Bicep"
+            inputs:
+              azureSubscription: "Azure-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az deployment group create --resource-group ml-chatbot-rg --template-file main.bicep --parameters main.parameters.json
+
+  - stage: Deploy_UI_and_API
+    displayName: "Deploy UI & API"
+    dependsOn: Deploy_Infrastructure
+    jobs:
+      - job: DeployContainers
+        displayName: "Deploy Next.js UI & API to AKS"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Wait for AKS Readiness"
+            inputs:
+              azureSubscription: "Azure-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Waiting for AKS to be ready..."
+                az aks show --resource-group ml-chatbot-rg --name ml-chatbot-aks --query "provisioningState"
+
+          - task: Kubernetes@1
+            displayName: "Apply Kubernetes Deployment"
+            inputs:
+              connectionType: "Azure Resource Manager"
+              azureSubscription: "Azure-Connection"
+              azureResourceGroup: "ml-chatbot-rg"
+              kubernetesCluster: "ml-chatbot-aks"
+              command: "apply"
+              arguments: "-f k8s/deployment.yaml -f k8s/service.yaml"
+
+
+  - stage: Deploy_Functions
+    displayName: "Deploy Azure Functions"
+    dependsOn: Deploy_Infrastructure
+    jobs:
+      - job: DeployFunctionApp
+        displayName: "Deploy Azure Function App"
+        steps:
+          - task: ArchiveFiles@2
+            displayName: "Archive Function App Code"
+            inputs:
+              rootFolderOrFile: "function-app/"
+              includeRootFolder: false
+              archiveType: "zip"
+              archiveFile: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+              replaceExistingArchive: true
+          - task: AzureFunctionApp@1
+            displayName: "Deploy Function App"
+            inputs:
+              azureSubscription: "Azure-Connection"
+              appName: "ml-chatbot-api"
+              package: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+

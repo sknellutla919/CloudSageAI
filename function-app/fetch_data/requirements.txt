@@ -1,0 +1,7 @@
+azure-functions
+requests
+azure-cosmos
+azure-ai-vision-imageanalysis
+azure-ai-documentintelligence
+python-dotenv
+

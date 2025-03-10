@@ -1,0 +1,298 @@
+trigger:
+  branches:
+    include:
+      - main2
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  resourceGroupName: 'jc-chatbot-rg'
+  location: 'westeurope'
+  searchServiceName: 'jcchatbot-search'
+  functionAppName: 'jc-chatbot-api'
+  acrName: 'jcchatbotacr'
+  openaiName: 'jcchatbot-openai'
+  contentSafetyName: 'jc-chatbot-content-safety'
+  appInsightsName: 'jc-chatbot-app-insights'
+  cosmosdbName: 'jcchatbotcosmos'
+
+stages:
+  - stage: ResourceGroupSetup
+    displayName: "Check or Create Resource Group"
+    jobs:
+      - job: CheckCreateRG
+        displayName: "Check if RG exists, create if not"
+        steps:
+          - task: AzureCLI@2
+            displayName: "RG Check/Create"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Check if resource group exists
+                RG_EXISTS=$(az group exists --name $(resourceGroupName))
+                echo "Resource group exists: $RG_EXISTS"
+                
+                if [ "$RG_EXISTS" = "false" ]; then
+                  echo "Creating resource group $(resourceGroupName)..."
+                  az group create --name $(resourceGroupName) --location $(location)
+                  echo "Resource group created."
+                else
+                  echo "Resource group already exists. Proceeding..."
+                fi
+
+  - stage: DeploySearchService
+    displayName: "Deploy Search Service"
+    dependsOn: ResourceGroupSetup
+    jobs:
+      - job: DeploySearch
+        displayName: "Deploy Azure Search Service"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Deploy Search Bicep"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az deployment group create \
+                  --resource-group $(resourceGroupName) \
+                  --template-file bicep/search.bicep \
+                  --parameters location=$(location) cognitiveSearchName=$(searchServiceName)
+                
+                echo "Waiting for Search Service to be fully provisioned (2 minutes)..."
+                sleep 120
+
+  - stage: CreateSearchIndex
+    displayName: "Create Search Index"
+    dependsOn: DeploySearchService
+    jobs:
+      - job: CreateIndex
+        displayName: "Create Index and Sample Document"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Create Index with Script"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                chmod +x $(Build.SourcesDirectory)/bicep/searchindex.sh
+                $(Build.SourcesDirectory)/bicep/searchindex.sh $(searchServiceName) $(cosmosdbName) $(resourceGroupName)
+
+  - stage: DeployInfrastructure
+    displayName: "Deploy Base Infrastructure"
+    dependsOn: CreateSearchIndex
+    jobs:
+      - job: DeployBicep
+        displayName: "Deploy Main Infrastructure"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Deploy Infrastructure Bicep"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Deploy main infrastructure and capture outputs
+                echo "Deploying main infrastructure..."
+                DEPLOY_OUTPUT=$(az deployment group create \
+                  --resource-group $(resourceGroupName) \
+                  --template-file bicep/deploy.bicep \
+                  --output json)
+                
+                # Extract the identity ID from the deployment output
+                CONTAINER_APP_IDENTITY_ID=$(echo $DEPLOY_OUTPUT | jq -r '.properties.outputs.containerAppIdentityId.value')
+
+                 # Verify ID was captured
+                if [ -z "$CONTAINER_APP_IDENTITY_ID" ]; then
+                  echo "Error: Container App Identity ID could not be retrieved from deployment output"
+                  exit 1
+                fi
+                
+                # Save as pipeline variable for later stages
+                echo "##vso[task.setvariable variable=containerAppIdentityId;isOutput=true]$CONTAINER_APP_IDENTITY_ID"
+                echo "Container App Identity ID: $CONTAINER_APP_IDENTITY_ID"
+
+  - stage: BuildAndPushImages
+    displayName: "Build and Push Docker Images"
+    dependsOn: DeployInfrastructure
+    jobs:
+      - job: DockerBuildPush
+        displayName: "Build and Push to ACR"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Get ACR Name"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get ACR name from resource group
+                ACR_NAME=$(az acr list -g $(resourceGroupName) --query "[0].name" -o tsv)
+                echo "##vso[task.setvariable variable=acrName]$ACR_NAME"
+          - task: Docker@2
+            displayName: "Build and Push UI Image"
+            inputs:
+              command: "buildAndPush"
+              containerRegistry: "CloudSageAI-JC-ACR"
+              repository: "chatbot-ui"
+              dockerfile: "ui/Dockerfile"
+              buildContext: "ui"
+              tags: |
+                latest
+                $(Build.BuildId)
+          - task: Docker@2
+            displayName: "Build and Push API Image"
+            inputs:
+              command: "buildAndPush"
+              containerRegistry: "CloudSageAI-JC-ACR"
+              repository: "chatbot-api"
+              dockerfile: "api/Dockerfile"
+              buildContext: "api"
+              tags: |
+                latest
+                $(Build.BuildId)
+  - stage: DeployContainerApps
+    displayName: "Deploy Container Apps"
+    dependsOn: 
+      - BuildAndPushImages
+      - DeployInfrastructure
+    variables:
+      containerAppIdentityId: $[ dependencies.DeployInfrastructure.outputs['DeployBicep.containerAppIdentityId'] ]
+    jobs:
+      - job: DeployContainerApps
+        displayName: "Deploy Container Apps Bicep"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Get Resource Keys & Deploy Container Apps"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get App Insights Instrumentation Key
+                echo "Getting App Insights Instrumentation Key..."
+                INSIGHTS_KEY=$(az monitor app-insights component show \
+                  --resource-group $(resourceGroupName) \
+                  --app $(appInsightsName) \
+                  --query instrumentationKey -o tsv)
+
+                # Get Search Admin Key
+                echo "Getting Search Admin Key..."
+                SEARCH_KEY=$(az search admin-key show \
+                  --resource-group $(resourceGroupName) \
+                  --service-name $(searchServiceName) \
+                  --query primaryKey -o tsv)
+
+                # Get OpenAI Key
+                echo "Getting OpenAI Key..."
+                OPENAI_KEY=$(az cognitiveservices account keys list \
+                  --resource-group $(resourceGroupName) \
+                  --name $(openaiName) \
+                  --query key1 -o tsv)
+
+                # Get Content Safety Key
+                echo "Getting Content Safety Key..."
+                SAFETY_KEY=$(az cognitiveservices account keys list \
+                  --resource-group $(resourceGroupName) \
+                  --name $(contentSafetyName) \
+                  --query key1 -o tsv)
+
+                # Get Cosmos DB Key
+                echo "Getting Cosmos DB Key..."
+                COSMOS_CONNECTION="AccountEndpoint=$(az cosmosdb show \
+                  --resource-group $(resourceGroupName) \
+                  --name $(cosmosdbName) \
+                  --query documentEndpoint -o tsv);AccountKey=$(az cosmosdb keys list \
+                  --resource-group $(resourceGroupName) \
+                  --name $(cosmosdbName) \
+                  --query primaryMasterKey -o tsv);"
+
+                # Display the values (masking sensitive parts)
+                echo "App Insights Key: ${INSIGHTS_KEY:0:5}*****"
+                echo "Search Key: ${SEARCH_KEY:0:5}*****"
+                echo "OpenAI Key: ${OPENAI_KEY:0:5}*****"
+                echo "Content Safety Key: ${SAFETY_KEY:0:5}*****"
+                echo "Cosmos Connection: AccountEndpoint=***;AccountKey=***"
+                
+
+                # Verify all keys were retrieved successfully
+                if [ -z "$INSIGHTS_KEY" ] || [ -z "$SEARCH_KEY" ] || [ -z "$OPENAI_KEY" ] || [ -z "$SAFETY_KEY" ] || [ -z "$COSMOS_CONNECTION" ]; then
+                  echo "Error: One or more required keys could not be retrieved."
+                  [ -z "$INSIGHTS_KEY" ] && echo "Missing: App Insights Key"
+                  [ -z "$SEARCH_KEY" ] && echo "Missing: Search Key"
+                  [ -z "$OPENAI_KEY" ] && echo "Missing: OpenAI Key"
+                  [ -z "$SAFETY_KEY" ] && echo "Missing: Content Safety Key"
+                  [ -z "$COSMOS_CONNECTION" ] && echo "Missing: Cosmos Connection"
+                  exit 1
+                fi
+
+                # Deploy Container Apps with parameters
+                echo "Deploying Container Apps with retrieved keys..."
+                az deployment group create \
+                  --resource-group $(resourceGroupName) \
+                  --template-file bicep/container-apps.bicep \
+                  --parameters insightsKey="$INSIGHTS_KEY" \
+                              searchKey="$SEARCH_KEY" \
+                              openaiKey="$OPENAI_KEY" \
+                              contentSafetyKey="$SAFETY_KEY" \
+                              cosmosConnection="$COSMOS_CONNECTION" 
+  - stage: DeployFunctionAppCode
+    displayName: "Deploy Function App Code"
+    dependsOn: DeployContainerApps
+    jobs:
+      - job: FunctionDeploy
+        displayName: "Package and Deploy Function App"
+        steps:
+          - script: |
+              python -m pip install --upgrade pip
+              pip install azure-ai-vision-imageanalysis
+              pip install -r function-app/fetch_data/requirements.txt -t function-app/fetch_data/
+            displayName: "Install Python Dependencies"
+
+          - task: ArchiveFiles@2
+            displayName: "Archive Function App Code"
+            inputs:
+              rootFolderOrFile: "function-app/fetch_data/"
+              includeRootFolder: true
+              archiveType: "zip"
+              archiveFile: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+              replaceExistingArchive: true
+
+          - task: AzureFunctionApp@1
+            displayName: "Deploy to Azure Function"
+            inputs:
+              azureSubscription: "CloudSageAI-SP"
+              appName: "$(functionAppName)"
+              package: "$(Build.ArtifactStagingDirectory)/function-app.zip"
+
+  - stage: DeployFlattenFunction
+    displayName: "Deploy Flatten Azure Function"
+    dependsOn: DeployInfrastructure
+    jobs:
+      - job: DeployFlattenFunction
+        displayName: "Deploy Flatten Azure Function"
+        steps:
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r function-app-flatten/FlattenCosmosData/requirements.txt -t function-app/FlattenCosmosData/
+            displayName: "Install Function Dependencies"
+
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: 'function-app-flatten/FlattenCosmosData/'
+              includeRootFolder: true
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/flatten-function.zip'
+              replaceExistingArchive: true
+            displayName: "Zip Function App Files"
+
+          - task: AzureFunctionApp@1
+            displayName: "Deploy to Azure Function"
+            inputs:
+              azureSubscription: 'CloudSageAI-SP'
+              appName: 'jc-chatbot-flatten-func' # function app name in Azure
+              package: '$(Build.ArtifactStagingDirectory)/flatten-function.zip'
